@@ -157,7 +157,7 @@ dp_found:
 //
 // Eight lanes per iteration so each iteration fills exactly one bitmap byte with
 // a single read-modify-write.
-TEXT ·findBlocksClamp(SB), NOSPLIT|NOFRAME, $0-64
+TEXT ·findBlocksClampSSE2(SB), NOSPLIT|NOFRAME, $0-64
 	MOVQ     cost_base+0(FP), SI
 	MOVQ     cost_len+8(FP), R9
 	MOVQ     sig_base+24(FP), R8

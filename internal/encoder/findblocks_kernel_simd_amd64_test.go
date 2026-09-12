@@ -351,10 +351,10 @@ func benchmarkFindBlocksClamp(b *testing.B, n int) {
 			findBlocksClampScalarReference(cost, sig, 0.5, findBlocksTestSwitchCost)
 		}
 	})
-	b.Run("impl=after_sse2_asm", func(b *testing.B) {
+	b.Run("impl=before_sse2_asm", func(b *testing.B) {
 		b.ReportAllocs()
 		for range b.N {
-			findBlocksClamp(cost, sig, 0.5, findBlocksTestSwitchCost)
+			findBlocksClampSSE2(cost, sig, 0.5, findBlocksTestSwitchCost)
 		}
 	})
 }

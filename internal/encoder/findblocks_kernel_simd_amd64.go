@@ -31,4 +31,4 @@ func findBlocksDPStep(cost, insertCost []float64) (minCost float64, best int)
 // Implemented in findblocks_kernel_simd_amd64.s.
 //
 //go:noescape
-func findBlocksClamp(cost []float64, sig []byte, minCost, switchCost float64)
+func findBlocksClampSSE2(cost []float64, sig []byte, minCost, switchCost float64)
