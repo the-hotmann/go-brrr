@@ -1173,6 +1173,7 @@ func (s *decodeState) readCodeLengthCodeLengths() decoderResult {
 		if !prefixAvailable {
 			avail := br.availBits()
 			if avail != 0 {
+				br.normalize()
 				ix = br.bitsUnmasked() & 0xF
 			} else {
 				ix = 0
@@ -1396,6 +1397,7 @@ slow:
 			availBits := br.availBits()
 			var bits uint64
 			if availBits != 0 {
+				br.normalize()
 				bits = br.bitsUnmasked()
 			}
 			entry := p[bits&bitMask(core.HuffmanMaxCodeLengthCodeLength)]
@@ -1561,20 +1563,20 @@ commandBegin:
 
 		insertLenExtra = 0
 		if v.InsertLenExtraBits != 0 {
-			if bitPos <= 32 {
-				val |= uint64(*(*uint32)(unsafe.Add(br.inputBase, br.pos))) << bitPos
-				bitPos += 32
-				br.pos += 4
+			if bitPos < 56 {
+				val |= *(*uint64)(unsafe.Add(br.inputBase, br.pos)) << (bitPos & 63)
+				br.pos += int((63 - bitPos) >> 3)
+				bitPos |= 56
 			}
 			insertLenExtra = val & bitMask(uint(v.InsertLenExtraBits))
 			val >>= uint(v.InsertLenExtraBits) & 63
 			bitPos -= uint(v.InsertLenExtraBits)
 		}
 
-		if bitPos <= 32 {
-			val |= uint64(*(*uint32)(unsafe.Add(br.inputBase, br.pos))) << bitPos
-			bitPos += 32
-			br.pos += 4
+		if bitPos < 56 {
+			val |= *(*uint64)(unsafe.Add(br.inputBase, br.pos)) << (bitPos & 63)
+			br.pos += int((63 - bitPos) >> 3)
+			bitPos |= 56
 		}
 		copyExtra := val & bitMask(uint(v.CopyLenExtraBits))
 		val >>= uint(v.CopyLenExtraBits) & 63
@@ -1649,7 +1651,7 @@ commandInner:
 
 			// Batch decode: when we have enough input, ringbuffer space,
 			// and block length, decode multiple literals without per-symbol checks.
-			n := min(i, int(s.blockLength[0]), s.ringbufferSize-pos, (br.availIn()-4)/2)
+			n := min(i, int(s.blockLength[0]), s.ringbufferSize-pos, (br.availIn()-8)/2)
 			if n == 1 {
 				// Inline single-symbol decode to avoid decodeLiteralsBatch
 				// function-call overhead (register save/restore) for the common
@@ -1727,7 +1729,7 @@ commandInner:
 			// Batch decode: when we have enough input, ringbuffer space,
 			// and block length, decode multiple context-dependent literals
 			// without per-symbol bounds checks.
-			n := min(i, int(s.blockLength[0]), s.ringbufferSize-pos, (br.availIn()-4)/2)
+			n := min(i, int(s.blockLength[0]), s.ringbufferSize-pos, (br.availIn()-8)/2)
 			if n > 0 {
 				p1, p2 = decodeLiteralsContextBatch(
 					s.ringbuffer[pos:], n,
@@ -1834,10 +1836,10 @@ commandPostDecodeLiterals:
 				b := &s.bodyArena
 				nExtra := uint(*(*byte)(unsafe.Add(unsafe.Pointer(&b.distExtraBits[0]), uintptr(code))))
 				offset := *(*uint)(unsafe.Add(unsafe.Pointer(&b.distOffset[0]), uintptr(code)*unsafe.Sizeof(uint(0))))
-				if bitPos <= 32 {
-					val |= uint64(*(*uint32)(unsafe.Add(br.inputBase, br.pos))) << bitPos
-					bitPos += 32
-					br.pos += 4
+				if bitPos < 56 {
+					val |= *(*uint64)(unsafe.Add(br.inputBase, br.pos)) << (bitPos & 63)
+					br.pos += int((63 - bitPos) >> 3)
+					bitPos |= 56
 				}
 				bits := val & bitMask(nExtra)
 				br.val = val >> (nExtra & 63)
@@ -2167,9 +2169,10 @@ func decodeDistanceSymbolSecondLevel(bits uint64, table []core.HuffmanCode, offs
 // decodeLiteralsBatch decodes n literal symbols from br into dst using table.
 // It hoists the bitReader state into local variables to keep them in registers
 // and avoid repeated struct field access on the hot path.
-// The loop is 2x-unrolled: after one fill (bitPos goes from ≤32 to ≥33),
-// two Huffman decodes (each consuming ≤15 bits) are safe without a second fill
-// since 33−30 = 3 bits always remain, and the next pair will refill.
+// The fill is on demand: a symbol consumes at most core.HuffmanMaxCodeLength
+// bits, so bits are only loaded once fewer than that remain. One fill leaves
+// ≥56 bits, which covers about nine to fourteen symbols at typical code
+// lengths, so the branch is taken rarely and predicts well.
 func decodeLiteralsBatch(dst []byte, n int, table []core.HuffmanCode, br *bitReader) {
 	val := br.val
 	bitPos := br.bitPos
@@ -2177,55 +2180,13 @@ func decodeLiteralsBatch(dst []byte, n int, table []core.HuffmanCode, br *bitRea
 	inputBase := br.inputBase
 	tableBase := unsafe.Pointer(unsafe.SliceData(table))
 
-	j := 0
-	for ; j+1 < n; j += 2 {
-		// fillBitWindow inline — one fill covers two symbols.
-		if bitPos <= 32 {
-			val |= uint64(*(*uint32)(unsafe.Add(inputBase, brPos))) << bitPos
-			bitPos += 32
-			brPos += 4
+	for j := range n {
+		if bitPos < core.HuffmanMaxCodeLength {
+			val |= *(*uint64)(unsafe.Add(inputBase, brPos)) << (bitPos & 63)
+			brPos += int((63 - bitPos) >> 3)
+			bitPos |= 56
 		}
 
-		// Symbol 1
-		idx := val & huffmanTableMask
-		raw := *(*uint32)(unsafe.Add(tableBase, idx*4))
-		drop := uint(raw & 0xFF)
-		value := uint(raw >> 16)
-		if drop > huffmanTableBits {
-			nbits := drop - huffmanTableBits
-			idx2 := idx + uint64(value) + ((val >> huffmanTableBits) & bitMask(nbits))
-			raw = *(*uint32)(unsafe.Add(tableBase, idx2*4))
-			drop = huffmanTableBits + uint(raw&0xFF)
-			value = uint(raw >> 16)
-		}
-		bitPos -= drop
-		val >>= drop & 63
-		dst[j] = byte(value)
-
-		// Symbol 2 — at least 18 bits remain (33 − 15), enough for any code (max 15).
-		idx = val & huffmanTableMask
-		raw = *(*uint32)(unsafe.Add(tableBase, idx*4))
-		drop = uint(raw & 0xFF)
-		value = uint(raw >> 16)
-		if drop > huffmanTableBits {
-			nbits := drop - huffmanTableBits
-			idx2 := idx + uint64(value) + ((val >> huffmanTableBits) & bitMask(nbits))
-			raw = *(*uint32)(unsafe.Add(tableBase, idx2*4))
-			drop = huffmanTableBits + uint(raw&0xFF)
-			value = uint(raw >> 16)
-		}
-		bitPos -= drop
-		val >>= drop & 63
-		dst[j+1] = byte(value)
-	}
-
-	// Handle remaining odd element.
-	if j < n {
-		if bitPos <= 32 {
-			val |= uint64(*(*uint32)(unsafe.Add(inputBase, brPos))) << bitPos
-			bitPos += 32
-			brPos += 4
-		}
 		idx := val & huffmanTableMask
 		raw := *(*uint32)(unsafe.Add(tableBase, idx*4))
 		drop := uint(raw & 0xFF)
@@ -2268,11 +2229,10 @@ func decodeLiteralsContextBatch(
 
 	for n > 0 {
 		n--
-		// fillBitWindow inline
-		if bitPos <= 32 {
-			val |= uint64(*(*uint32)(unsafe.Add(inputBase, brPos))) << bitPos
-			bitPos += 32
-			brPos += 4
+		if bitPos < core.HuffmanMaxCodeLength {
+			val |= *(*uint64)(unsafe.Add(inputBase, brPos)) << (bitPos & 63)
+			brPos += int((63 - bitPos) >> 3)
+			bitPos |= 56
 		}
 
 		// Context lookup inline — contextLookup has 512 entries,
@@ -2317,6 +2277,7 @@ func safeDecodeSymbol(table []core.HuffmanCode, br *bitReader) (uint, bool) {
 		}
 		return 0, false
 	}
+	br.normalize()
 	val := br.bitsUnmasked()
 	idx := val & huffmanTableMask
 	entry := table[idx]
