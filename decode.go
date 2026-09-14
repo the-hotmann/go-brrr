@@ -41,6 +41,7 @@ var decodeStatePool = sync.Pool{
 	New: func() any {
 		s := new(decodeState)
 		s.init()
+		s.outChunks = chunkWriter{pool: &decodeChunkPool, size: decodeChunkSize}
 		return s
 	},
 }
@@ -76,31 +77,44 @@ func Decompress(data []byte) ([]byte, error) {
 	s := decodeStatePool.Get().(*decodeState)
 	s.initForReuse()
 	s.br.setInput(data)
-	var output []byte
-	var err error
+	s.sink = &s.outChunks
+	_, err := s.decodeAll(nil)
+	s.sink = nil
+	if err != nil {
+		s.outChunks.discard()
+		decodeStatePool.Put(s)
+		return nil, err
+	}
+	out := s.outChunks.take()
+	decodeStatePool.Put(s)
+	return out, nil
+}
+
+func AppendDecompress(dst, data []byte) ([]byte, error) {
+	s := decodeStatePool.Get().(*decodeState)
+	s.initForReuse()
+	s.br.setInput(data)
+	out, err := s.decodeAll(dst)
+	decodeStatePool.Put(s)
+	if err != nil {
+		return dst, err
+	}
+	return out, nil
+}
+
+func (s *decodeState) decodeAll(output []byte) ([]byte, error) {
 	for {
 		switch s.decompressStream(&output) {
 		case decoderResultSuccess:
 			if s.excessiveInput() {
-				decodeStatePool.Put(s)
-				return nil, ErrExcessiveInput
+				return output, ErrExcessiveInput
 			}
-			result := s.flushOutput(output)
-			decodeStatePool.Put(s)
-			return result, nil
+			return s.flushOutput(output), nil
 		case decoderResultError:
-			err = s.err
-			decodeStatePool.Put(s)
-			return nil, err
+			return output, s.err
 		case decoderResultNeedsMoreInput:
-			decodeStatePool.Put(s)
-			return nil, decompressError("truncated input")
+			return output, decompressError("truncated input")
 		case decoderResultNeedsMoreOutput:
-			if cap(output)-len(output) < 2*s.ringbufferSize {
-				grown := make([]byte, len(output), max(len(output)+2*s.ringbufferSize, 2*cap(output)))
-				copy(grown, output)
-				output = grown
-			}
 			output = s.flushOutput(output)
 		}
 	}
@@ -392,7 +406,11 @@ func (s *decodeState) flushOutput(output []byte) []byte {
 	pos := min(s.pos, s.ringbufferSize)
 	flushed := int(s.partialPosOut) - int(s.rbRoundtrips)*s.ringbufferSize
 	if pos > flushed {
-		output = append(output, s.ringbuffer[flushed:pos]...)
+		if s.sink != nil {
+			s.sink.write(s.ringbuffer[flushed:pos])
+		} else {
+			output = append(output, s.ringbuffer[flushed:pos]...)
+		}
 		s.partialPosOut += uint(pos - flushed)
 	}
 	return output
@@ -412,10 +430,14 @@ func (s *decodeState) writeRingBuffer(output *[]byte) {
 				newSize = min(newSize<<1, 1<<s.windowBits)
 			}
 			if newSize != s.ringbufferSize {
-				newBuf := getDecRingBuf(newSize + ringBufferWriteAheadSlack)
-				copy(newBuf, s.ringbuffer[:s.pos])
-				putDecRingBuf(s.ringbuffer)
-				s.ringbuffer = newBuf
+				if cap(s.ringbuffer) >= newSize+ringBufferWriteAheadSlack {
+					s.ringbuffer = s.ringbuffer[:newSize+ringBufferWriteAheadSlack]
+				} else {
+					newBuf := getDecRingBuf(newSize + ringBufferWriteAheadSlack)
+					copy(newBuf, s.ringbuffer[:s.pos])
+					putDecRingBuf(s.ringbuffer)
+					s.ringbuffer = newBuf
+				}
 				s.ringbufferSize = newSize
 				s.ringbufferMask = newSize - 1
 				s.newRingbufferSize = newSize
@@ -424,7 +446,11 @@ func (s *decodeState) writeRingBuffer(output *[]byte) {
 				return
 			}
 		}
-		*output = append(*output, s.ringbuffer[int(s.partialPosOut)-int(s.rbRoundtrips)*s.ringbufferSize:s.ringbufferSize]...)
+		if s.sink != nil {
+			s.sink.write(s.ringbuffer[int(s.partialPosOut)-int(s.rbRoundtrips)*s.ringbufferSize : s.ringbufferSize])
+		} else {
+			*output = append(*output, s.ringbuffer[int(s.partialPosOut)-int(s.rbRoundtrips)*s.ringbufferSize:s.ringbufferSize]...)
+		}
 		s.partialPosOut = s.rbRoundtrips*uint(s.ringbufferSize) + uint(s.ringbufferSize)
 		s.pos -= s.ringbufferSize
 		s.rbRoundtrips++

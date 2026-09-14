@@ -3,10 +3,11 @@
 package brrr
 
 import (
-	"bytes"
 	"errors"
 	"io"
+	"runtime"
 	"strconv"
+	"sync"
 
 	"github.com/molecule-man/go-brrr/internal/encoder"
 )
@@ -38,8 +39,8 @@ func NewWriter(dst io.Writer, level int) (*Writer, error) {
 // selects the default (22). Compound dictionaries supplied via opts.Dictionaries
 // require level >= 2.
 func NewWriterOptions(dst io.Writer, level int, opts WriterOptions) (*Writer, error) {
-	if level < 0 || level > 11 {
-		return nil, errors.New("brrr: invalid compression level: " + strconv.Itoa(level))
+	if err := checkLevel(level); err != nil {
+		return nil, err
 	}
 
 	lgwin := opts.LGWin
@@ -63,7 +64,19 @@ func NewWriterOptions(dst io.Writer, level int, opts WriterOptions) (*Writer, er
 	for _, pd := range w.dicts {
 		_ = w.c.AttachDictionary(pd.impl)
 	}
+	if level >= minWorkerLevel {
+		runtime.SetFinalizer(w, (*Writer).release)
+	}
 	return w, nil
+}
+
+const minWorkerLevel = 10
+
+func (w *Writer) release() {
+	if w.c != nil {
+		w.c.Release()
+		w.c = nil
+	}
 }
 
 // Compress compresses data at the given quality level and returns the
@@ -71,22 +84,150 @@ func NewWriterOptions(dst io.Writer, level int, opts WriterOptions) (*Writer, er
 // Supported levels are 0 (BestSpeed) through 11 (BestCompression). The exact
 // input length is supplied to the encoder as a size hint.
 func Compress(data []byte, level int) ([]byte, error) {
-	var buf bytes.Buffer
-	w, err := NewWriterOptions(&buf, level, WriterOptions{SizeHint: uint(len(data))})
+	o, err := getOneshotCompressor(level, uint(len(data)))
 	if err != nil {
 		return nil, err
 	}
-	if _, err := w.Write(data); err != nil {
+	err = o.compress(&o.chunks, data)
+	if err != nil {
+		o.chunks.discard()
+		o.drop()
 		return nil, err
 	}
-	if err := w.Close(); err != nil {
-		return nil, err
-	}
-	out := buf.Bytes()
-	if cap(out)-len(out) > len(out)/8 {
-		out = append(make([]byte, 0, len(out)), out...)
-	}
+	out := o.chunks.take()
+	oneshotCompressors[level].Put(o)
 	return out, nil
+}
+
+func AppendCompress(dst, data []byte, level int) ([]byte, error) {
+	o, err := getOneshotCompressor(level, uint(len(data)))
+	if err != nil {
+		return dst, err
+	}
+	o.appended.buf = dst
+	err = o.compress(&o.appended, data)
+	out := o.appended.buf
+	o.appended.buf = nil
+	if err != nil {
+		o.drop()
+		return dst, err
+	}
+	oneshotCompressors[level].Put(o)
+	return out, nil
+}
+
+var oneshotCompressors [maxLevel + 1]sync.Pool
+
+const maxLevel = 11
+
+type oneshotCompressor struct {
+	c        encoder.Compressor
+	appended appendWriter
+	chunks   chunkWriter
+}
+
+func getOneshotCompressor(level int, sizeHint uint) (*oneshotCompressor, error) {
+	if err := checkLevel(level); err != nil {
+		return nil, err
+	}
+	if v := oneshotCompressors[level].Get(); v != nil {
+		o := v.(*oneshotCompressor)
+		o.c.ResetSizeHint(sizeHint)
+		return o, nil
+	}
+	o := &oneshotCompressor{
+		c:      encoder.NewCompressor(level, defaultLGWin, sizeHint),
+		chunks: chunkWriter{pool: &encodeChunkPool, size: encodeChunkSize},
+	}
+	if level >= minWorkerLevel {
+		runtime.SetFinalizer(o, (*oneshotCompressor).drop)
+	}
+	return o, nil
+}
+
+func (o *oneshotCompressor) compress(dst io.Writer, data []byte) error {
+	if _, err := o.c.Write(dst, data); err != nil {
+		return err
+	}
+	return o.c.Close(dst)
+}
+
+func (o *oneshotCompressor) drop() {
+	if o.c != nil {
+		o.c.Release()
+		o.c = nil
+	}
+}
+
+func checkLevel(level int) error {
+	if level < 0 || level > maxLevel {
+		return errors.New("brrr: invalid compression level: " + strconv.Itoa(level))
+	}
+	return nil
+}
+
+type appendWriter struct {
+	buf []byte
+}
+
+func (w *appendWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	return len(p), nil
+}
+
+const (
+	encodeChunkSize = 64 << 10
+	decodeChunkSize = 272 << 10
+)
+
+var (
+	encodeChunkPool = sync.Pool{New: func() any { b := make([]byte, encodeChunkSize); return &b }}
+	decodeChunkPool = sync.Pool{New: func() any { b := make([]byte, decodeChunkSize); return &b }}
+)
+
+type chunkWriter struct {
+	pool   *sync.Pool
+	chunks []*[]byte
+	size   int
+	n      int
+}
+
+func (w *chunkWriter) Write(p []byte) (int, error) {
+	w.write(p)
+	return len(p), nil
+}
+
+func (w *chunkWriter) write(p []byte) {
+	for len(p) > 0 {
+		if w.n == len(w.chunks)*w.size {
+			w.chunks = append(w.chunks, w.pool.Get().(*[]byte))
+		}
+		copied := copy((*w.chunks[len(w.chunks)-1])[w.n%w.size:], p)
+		w.n += copied
+		p = p[copied:]
+	}
+}
+
+func (w *chunkWriter) take() []byte {
+	if w.n == 0 {
+		w.discard()
+		return nil
+	}
+	out := make([]byte, w.n)
+	for i, chunk := range w.chunks {
+		copy(out[i*w.size:], *chunk)
+	}
+	w.discard()
+	return out
+}
+
+func (w *chunkWriter) discard() {
+	for i, chunk := range w.chunks {
+		w.pool.Put(chunk)
+		w.chunks[i] = nil
+	}
+	w.chunks = w.chunks[:0]
+	w.n = 0
 }
 
 // Write compresses p and writes it to the underlying writer.
